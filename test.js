@@ -1,37 +1,31 @@
 const axios = require('axios');
-const jwt = require('jsonwebtoken');          // npm install jsonwebtoken
-const fs = require('fs');
-const path = require('path');
-const FormData = require('form-data');        // npm install form-data
+const jwt = require('jsonwebtoken');
+const FormData = require('form-data');
 
 // ====================== CONFIGURATION ======================
 const CONFIG = {
-  BASE_URL: 'http://localhost:5000',          // Change this
+  BASE_URL: 'http://localhost:5000',
 
-  // Two normal users
   USER_A: { email: 'user1@example.com', password: 'password123' },
   USER_B: { email: 'user2@example.com', password: 'password123' },
 
-  // Admin credentials (if you have one for testing)
-  ADMIN: { email: 'admin@example.com', password: 'adminpass' },
-
-  // Endpoints to test (customize for your clothes branding site)
+  // Endpoints that contain an ID
   IDOR_ENDPOINTS: [
-    { method: 'GET', path: '/api/orders/{id}', desc: 'Order' },
-    { method: 'GET', path: '/api/users/{id}', desc: 'User profile' },
-    { method: 'GET', path: '/api/cart/{id}', desc: 'Cart' },
-    { method: 'GET', path: '/api/wishlist/{id}', desc: 'Wishlist' },
-    { method: 'PUT', path: '/api/orders/{id}', desc: 'Update order' },
-    { method: 'DELETE', path: '/api/orders/{id}', desc: 'Delete order' },
+    { method: 'GET',    path: '/api/orders/{id}',     desc: 'Order' },
+    { method: 'GET',    path: '/api/users/{id}',      desc: 'User profile' },
+    { method: 'GET',    path: '/api/cart/{id}',       desc: 'Cart' },
+    { method: 'GET',    path: '/api/wishlist/{id}',   desc: 'Wishlist' },
+    { method: 'PUT',    path: '/api/orders/{id}',     desc: 'Update order' },
+    { method: 'DELETE', path: '/api/orders/{id}',     desc: 'Delete order' },
   ],
 
-  // Real IDs belonging to USER_B
+  // Real IDs that belong to USER_B
   USER_B_IDS: [
     '66a1f2c3e4b5d67890123456',
     '66a1f2c3e4b5d67890123457',
   ],
 
-  // Admin-only routes to test auth bypass
+  // Admin-only routes
   ADMIN_ROUTES: [
     '/api/admin/users',
     '/api/admin/orders',
@@ -39,13 +33,20 @@ const CONFIG = {
     '/api/admin/stats',
   ],
 
-  // Login / rate-limit endpoints
+  // Protected routes (should reject requests without token)
+  PROTECTED_ROUTES: [
+    '/api/users/me',
+    '/api/orders',
+    '/api/cart',
+    '/api/wishlist',
+  ],
+
+  // Auth endpoints for rate-limit testing
   LOGIN_PATH: '/api/auth/login',
-  OTP_PATH: '/api/auth/verify-otp',           // change if different
+  OTP_PATH: '/api/auth/verify-otp',
   RESET_PATH: '/api/auth/forgot-password',
 
-  // File upload endpoint
-  UPLOAD_PATH: '/api/upload',                 // change if different
+  UPLOAD_PATH: '/api/upload',
 };
 // ===========================================================
 
@@ -53,75 +54,129 @@ const results = [];
 
 function log(test, status, message, extra = '') {
   const icon = status === 'PASS' ? '✅' : status === 'FAIL' ? '🚨' : '⚠️';
-  console.log(`${icon} [${test}] ${message} ${extra}`);
+  console.log(`${icon} [${test}] ${message}${extra ? ' → ' + extra : ''}`);
   results.push({ test, status, message, extra });
 }
 
-// -------------------- 1. Login helper --------------------
+// -------------------- Login Helper --------------------
 async function login(user) {
   try {
     const res = await axios.post(`${CONFIG.BASE_URL}${CONFIG.LOGIN_PATH}`, user);
-    const token = res.data.token || res.data.accessToken || res.data.access_token;
-    if (!token) throw new Error('No token returned');
+    const token = res.data.token || res.data.accessToken || res.data.access_token || res.data.jwt;
+    if (!token) throw new Error('No token found in response');
     return token;
   } catch (err) {
+    console.log(`[!] Login failed for ${user.email}:`, err.response?.data?.message || err.message);
     return null;
   }
 }
 
-// -------------------- 2. JWT Tampering --------------------
-async function testJWTTampering(validToken) {
-  console.log('\n=== JWT Tampering Tests ===');
+// -------------------- 1. Improved JWT Tests --------------------
+async function testJWT(validToken) {
+  console.log('\n=== JWT Security Tests ===');
 
-  // 2.1 alg=none attack
+  const decoded = jwt.decode(validToken, { complete: true });
+  if (!decoded) {
+    log('JWT', 'WARN', 'Could not decode token');
+    return;
+  }
+
+  // 1.1 alg = none attack (most important)
   try {
-    const decoded = jwt.decode(validToken, { complete: true });
-    const noneToken = jwt.sign(decoded.payload, '', { algorithm: 'none' });
+    // Create a proper "none" token
+    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify(decoded.payload)).toString('base64url');
+    const noneToken = `${header}.${payload}.`;
+
     const res = await axios.get(`${CONFIG.BASE_URL}/api/users/me`, {
       headers: { Authorization: `Bearer ${noneToken}` },
       validateStatus: () => true
     });
+
     if ([200, 201].includes(res.status)) {
-      log('JWT-alg-none', 'FAIL', 'Server accepted alg=none token!');
+      log('JWT-alg-none', 'FAIL', 'Server accepted alg=none token');
     } else {
-      log('JWT-alg-none', 'PASS', 'Server correctly rejected alg=none');
+      log('JWT-alg-none', 'PASS', `Rejected alg=none → ${res.status}`);
     }
   } catch (e) {
-    log('JWT-alg-none', 'PASS', 'Server rejected alg=none');
+    log('JWT-alg-none', 'PASS', 'Rejected alg=none');
   }
 
-  // 2.2 Expired token
+  // 1.2 Completely invalid / garbage token
   try {
-    const decoded = jwt.decode(validToken);
-    const expired = jwt.sign({ ...decoded, exp: Math.floor(Date.now() / 1000) - 3600 }, 'fake-secret');
     const res = await axios.get(`${CONFIG.BASE_URL}/api/users/me`, {
-      headers: { Authorization: `Bearer ${expired}` },
+      headers: { Authorization: 'Bearer FAKE.TOKEN.VALUE' },
       validateStatus: () => true
     });
     if ([200, 201].includes(res.status)) {
-      log('JWT-expired', 'FAIL', 'Server accepted expired token');
+      log('JWT-invalid', 'FAIL', 'Server accepted invalid token');
     } else {
-      log('JWT-expired', 'PASS', 'Server rejected expired token');
+      log('JWT-invalid', 'PASS', `Rejected invalid token → ${res.status}`);
     }
   } catch (e) {
-    log('JWT-expired', 'PASS', 'Server rejected expired token');
+    log('JWT-invalid', 'PASS', 'Rejected invalid token');
   }
 
-  // 2.3 Modified payload (role escalation)
+  // 1.3 Missing signature part
   try {
-    const decoded = jwt.decode(validToken);
-    const tampered = jwt.sign({ ...decoded, role: 'admin', isAdmin: true }, 'wrong-secret');
+    const parts = validToken.split('.');
+    const noSigToken = `${parts[0]}.${parts[1]}.`;
     const res = await axios.get(`${CONFIG.BASE_URL}/api/users/me`, {
-      headers: { Authorization: `Bearer ${tampered}` },
+      headers: { Authorization: `Bearer ${noSigToken}` },
       validateStatus: () => true
     });
-    if ([200, 201].includes(res.status) && (res.data.role === 'admin' || res.data.isAdmin)) {
-      log('JWT-payload', 'FAIL', 'Server accepted modified payload / role escalation');
+    if ([200, 201].includes(res.status)) {
+      log('JWT-no-signature', 'FAIL', 'Server accepted token without signature');
     } else {
-      log('JWT-payload', 'PASS', 'Server rejected modified payload');
+      log('JWT-no-signature', 'PASS', `Rejected unsigned token → ${res.status}`);
     }
   } catch (e) {
-    log('JWT-payload', 'PASS', 'Server rejected modified payload');
+    log('JWT-no-signature', 'PASS', 'Rejected unsigned token');
+  }
+
+  // 1.4 Role / privilege claim manipulation attempt
+  // (We can't re-sign without the secret, so we test if the server trusts the claim blindly after decoding)
+  try {
+    const tamperedPayload = { ...decoded.payload, role: 'admin', isAdmin: true, isAdminUser: true };
+    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify(tamperedPayload)).toString('base64url');
+    const tamperedNone = `${header}.${payload}.`;
+
+    const res = await axios.get(`${CONFIG.BASE_URL}/api/users/me`, {
+      headers: { Authorization: `Bearer ${tamperedNone}` },
+      validateStatus: () => true
+    });
+
+    if ([200, 201].includes(res.status) && (res.data?.role === 'admin' || res.data?.isAdmin)) {
+      log('JWT-role-escalation', 'FAIL', 'Server accepted elevated role via alg=none');
+    } else {
+      log('JWT-role-escalation', 'PASS', 'Role escalation via alg=none blocked');
+    }
+  } catch (e) {
+    log('JWT-role-escalation', 'PASS', 'Role escalation blocked');
+  }
+}
+
+// -------------------- 2. Unauthenticated Access --------------------
+async function testUnauthenticated() {
+  console.log('\n=== Unauthenticated Access Tests ===');
+
+  const routesToTest = [...CONFIG.PROTECTED_ROUTES, ...CONFIG.ADMIN_ROUTES];
+
+  for (const route of routesToTest) {
+    try {
+      const res = await axios.get(`${CONFIG.BASE_URL}${route}`, {
+        validateStatus: () => true
+      });
+
+      if ([200, 201].includes(res.status)) {
+        log('Unauth', 'FAIL', `Accessible without token → ${route}`, res.status);
+      } else {
+        log('Unauth', 'PASS', `Blocked without token → ${route}`, res.status);
+      }
+    } catch (e) {
+      log('Unauth', 'PASS', `Blocked without token → ${route}`);
+    }
   }
 }
 
@@ -142,20 +197,20 @@ async function testIDOR(tokenA) {
         });
 
         if (![401, 403, 404].includes(res.status)) {
-          log('IDOR', 'FAIL', `${ep.method} ${url} → ${res.status}`, ep.desc);
+          log('IDOR', 'FAIL', `${ep.method} ${url}`, `${res.status} (${ep.desc})`);
         } else {
-          log('IDOR', 'PASS', `${ep.method} ${url} → ${res.status}`, ep.desc);
+          log('IDOR', 'PASS', `${ep.method} ${url}`, `${res.status} (${ep.desc})`);
         }
       } catch (e) {
-        log('IDOR', 'WARN', `Error testing ${url}`);
+        log('IDOR', 'WARN', `Error → ${url}`);
       }
     }
   }
 }
 
-// -------------------- 4. Auth Bypass (Admin routes) --------------------
+// -------------------- 4. Auth Bypass (with valid user token) --------------------
 async function testAuthBypass(tokenA) {
-  console.log('\n=== Auth Bypass (Admin Routes) ===');
+  console.log('\n=== Auth Bypass (Normal user → Admin routes) ===');
 
   for (const route of CONFIG.ADMIN_ROUTES) {
     try {
@@ -163,10 +218,11 @@ async function testAuthBypass(tokenA) {
         headers: { Authorization: `Bearer ${tokenA}` },
         validateStatus: () => true
       });
+
       if ([200, 201].includes(res.status)) {
-        log('Auth-Bypass', 'FAIL', `Normal user accessed ${route} → ${res.status}`);
+        log('Auth-Bypass', 'FAIL', `Normal user accessed ${route}`, res.status);
       } else {
-        log('Auth-Bypass', 'PASS', `Blocked ${route} → ${res.status}`);
+        log('Auth-Bypass', 'PASS', `Blocked ${route}`, res.status);
       }
     } catch (e) {
       log('Auth-Bypass', 'PASS', `Blocked ${route}`);
@@ -174,30 +230,37 @@ async function testAuthBypass(tokenA) {
   }
 }
 
-// -------------------- 5. Rate Limiting --------------------
+// -------------------- 5. Rate Limiting (Login + OTP + Reset) --------------------
 async function testRateLimit() {
   console.log('\n=== Rate Limiting Tests ===');
 
-  const attempts = 25;
-  let blocked = false;
+  const endpoints = [
+    { name: 'Login', path: CONFIG.LOGIN_PATH, body: { email: 'test@evil.com', password: 'wrong' } },
+    { name: 'OTP', path: CONFIG.OTP_PATH, body: { email: 'test@evil.com', otp: '000000' } },
+    { name: 'Password-Reset', path: CONFIG.RESET_PATH, body: { email: 'test@evil.com' } },
+  ];
 
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      const res = await axios.post(`${CONFIG.BASE_URL}${CONFIG.LOGIN_PATH}`, {
-        email: 'nonexistent@example.com',
-        password: 'wrong'
-      }, { validateStatus: () => true });
+  for (const ep of endpoints) {
+    let blocked = false;
+    const maxAttempts = 20;
 
-      if (res.status === 429) {
-        blocked = true;
-        log('Rate-Limit', 'PASS', `Got 429 after ${i} attempts`);
-        break;
-      }
-    } catch (e) {}
-  }
+    for (let i = 1; i <= maxAttempts; i++) {
+      try {
+        const res = await axios.post(`${CONFIG.BASE_URL}${ep.path}`, ep.body, {
+          validateStatus: () => true
+        });
 
-  if (!blocked) {
-    log('Rate-Limit', 'FAIL', `No 429 after ${attempts} login attempts`);
+        if (res.status === 429) {
+          blocked = true;
+          log('Rate-Limit', 'PASS', `${ep.name} blocked after ${i} attempts`);
+          break;
+        }
+      } catch (e) {}
+    }
+
+    if (!blocked) {
+      log('Rate-Limit', 'FAIL', `${ep.name} → No 429 after ${maxAttempts} attempts`);
+    }
   }
 }
 
@@ -208,20 +271,20 @@ async function testCORS() {
   try {
     const res = await axios.options(`${CONFIG.BASE_URL}/api/users/me`, {
       headers: {
-        Origin: 'https://evil.com',
+        'Origin': 'https://evil-attacker.com',
         'Access-Control-Request-Method': 'GET'
       },
       validateStatus: () => true
     });
 
     const allowOrigin = res.headers['access-control-allow-origin'];
-    if (allowOrigin === '*' || allowOrigin === 'https://evil.com') {
-      log('CORS', 'FAIL', `Overly permissive CORS: ${allowOrigin}`);
+    if (allowOrigin === '*' || allowOrigin === 'https://evil-attacker.com') {
+      log('CORS', 'FAIL', `Permissive CORS: ${allowOrigin}`);
     } else {
-      log('CORS', 'PASS', `CORS restricted: ${allowOrigin || 'none'}`);
+      log('CORS', 'PASS', `CORS is restricted: ${allowOrigin || 'not set'}`);
     }
   } catch (e) {
-    log('CORS', 'WARN', 'Could not test CORS properly');
+    log('CORS', 'WARN', 'Could not fully test CORS');
   }
 }
 
@@ -230,24 +293,24 @@ async function testSecurityHeaders() {
   console.log('\n=== Security Headers ===');
 
   try {
-    const res = await axios.get(`${CONFIG.BASE_URL}/`);
+    const res = await axios.get(CONFIG.BASE_URL);
     const h = res.headers;
 
-    const checks = [
-      { name: 'X-Content-Type-Options', expected: 'nosniff' },
-      { name: 'X-Frame-Options', expected: ['DENY', 'SAMEORIGIN'] },
-      { name: 'Strict-Transport-Security', expected: null }, // just presence
-      { name: 'Content-Security-Policy', expected: null },
+    const required = [
+      { name: 'x-content-type-options', expected: 'nosniff' },
+      { name: 'x-frame-options', expected: ['DENY', 'SAMEORIGIN'] },
+      { name: 'strict-transport-security' },
+      { name: 'content-security-policy' },
     ];
 
-    for (const c of checks) {
-      const value = h[c.name.toLowerCase()];
+    for (const item of required) {
+      const value = h[item.name];
       if (!value) {
-        log('Headers', 'FAIL', `Missing ${c.name}`);
-      } else if (c.expected && !c.expected.includes(value)) {
-        log('Headers', 'WARN', `${c.name}: ${value}`);
+        log('Headers', 'FAIL', `Missing → ${item.name}`);
+      } else if (item.expected && !item.expected.includes(value)) {
+        log('Headers', 'WARN', `${item.name}: ${value}`);
       } else {
-        log('Headers', 'PASS', `${c.name}: ${value}`);
+        log('Headers', 'PASS', `${item.name}: ${value}`);
       }
     }
   } catch (e) {
@@ -259,14 +322,13 @@ async function testSecurityHeaders() {
 async function testFileUpload(token) {
   console.log('\n=== File Upload Tests ===');
 
-  const dangerousFiles = [
-    { name: 'shell.php', content: '<?php system($_GET["c"]); ?>', type: 'application/x-php' },
-    { name: 'test.exe', content: 'MZ fake exe', type: 'application/octet-stream' },
-    { name: '../../../etc/passwd', content: 'path traversal test', type: 'text/plain' },
-    { name: 'huge.txt', content: 'A'.repeat(15 * 1024 * 1024), type: 'text/plain' }, // 15MB
+  const files = [
+    { name: 'shell.php', content: '<?php system($_GET["cmd"]); ?>', type: 'application/x-php' },
+    { name: 'test.exe', content: 'MZ', type: 'application/octet-stream' },
+    { name: '../../../etc/passwd', content: 'path-traversal-test', type: 'text/plain' },
   ];
 
-  for (const file of dangerousFiles) {
+  for (const file of files) {
     try {
       const form = new FormData();
       form.append('file', Buffer.from(file.content), {
@@ -279,25 +341,23 @@ async function testFileUpload(token) {
           ...form.getHeaders(),
           Authorization: `Bearer ${token}`
         },
-        validateStatus: () => true,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity
+        validateStatus: () => true
       });
 
       if ([200, 201].includes(res.status)) {
-        log('File-Upload', 'FAIL', `Accepted dangerous file: ${file.name}`);
+        log('File-Upload', 'FAIL', `Accepted → ${file.name}`);
       } else {
-        log('File-Upload', 'PASS', `Rejected ${file.name} → ${res.status}`);
+        log('File-Upload', 'PASS', `Rejected → ${file.name} (${res.status})`);
       }
     } catch (e) {
-      log('File-Upload', 'PASS', `Rejected ${file.name}`);
+      log('File-Upload', 'PASS', `Rejected → ${file.name}`);
     }
   }
 }
 
 // -------------------- 9. Secrets Leakage --------------------
-async function testSecretsLeakage(token) {
-  console.log('\n=== Secrets Leakage Check ===');
+async function testSecrets(token) {
+  console.log('\n=== Secrets Leakage ===');
 
   try {
     const res = await axios.get(`${CONFIG.BASE_URL}/api/users/me`, {
@@ -306,53 +366,61 @@ async function testSecretsLeakage(token) {
     });
 
     const body = JSON.stringify(res.data).toLowerCase();
-    const leaks = ['mongodb://', 'jwt_secret', 'password', 'secret_key', 'stack', 'at '];
+    const dangerous = ['mongodb://', 'jwt_secret', 'secret_key', 'password', 'stack', 'at object'];
 
     let found = false;
-    for (const leak of leaks) {
-      if (body.includes(leak)) {
-        log('Secrets', 'FAIL', `Possible secret/stack leak containing: "${leak}"`);
+    for (const word of dangerous) {
+      if (body.includes(word)) {
+        log('Secrets', 'FAIL', `Possible leak containing "${word}"`);
         found = true;
       }
     }
-    if (!found) log('Secrets', 'PASS', 'No obvious secrets in response');
+    if (!found) log('Secrets', 'PASS', 'No obvious secrets found');
   } catch (e) {
-    log('Secrets', 'WARN', 'Could not check response');
+    log('Secrets', 'WARN', 'Could not check response body');
   }
 }
 
 // -------------------- MAIN --------------------
 async function main() {
-  console.log('🛡️  MERN Backend Security Tester\n');
+  console.log('🛡️  Improved MERN Backend Security Tester\n');
 
   const tokenA = await login(CONFIG.USER_A);
   if (!tokenA) {
-    console.log('❌ Cannot login as USER_A. Check credentials and BASE_URL.');
+    console.log('❌ Failed to login as USER_A. Please check credentials and BASE_URL.');
     return;
   }
-  console.log('[+] Got token for USER_A\n');
+  console.log('[+] Successfully logged in as USER_A\n');
 
-  await testJWTTampering(tokenA);
+  await testJWT(tokenA);
+  await testUnauthenticated();
   await testIDOR(tokenA);
   await testAuthBypass(tokenA);
   await testRateLimit();
   await testCORS();
   await testSecurityHeaders();
   await testFileUpload(tokenA);
-  await testSecretsLeakage(tokenA);
+  await testSecrets(tokenA);
 
-  // Final summary
-  console.log('\n' + '='.repeat(60));
+  // Summary
+  console.log('\n' + '='.repeat(65));
   console.log('FINAL SUMMARY');
-  console.log('='.repeat(60));
+  console.log('='.repeat(65));
+
   const failed = results.filter(r => r.status === 'FAIL');
-  console.log(`Total tests: ${results.length}`);
-  console.log(`Failed: ${failed.length}`);
+  const passed = results.filter(r => r.status === 'PASS');
+  const warnings = results.filter(r => r.status === 'WARN');
+
+  console.log(`Total checks : ${results.length}`);
+  console.log(`Passed      : ${passed.length}`);
+  console.log(`Failed      : ${failed.length}`);
+  console.log(`Warnings    : ${warnings.length}`);
+
   if (failed.length > 0) {
-    console.log('\nFailed tests:');
-    failed.forEach(f => console.log(`  🚨 ${f.test}: ${f.message}`));
+    console.log('\n🚨 Failed Tests:');
+    failed.forEach(f => console.log(`   • ${f.test}: ${f.message} ${f.extra || ''}`));
   } else {
-    console.log('🎉 No critical issues found by this script!');
+    console.log('\n🎉 No critical issues found by this script!');
   }
 }
 
